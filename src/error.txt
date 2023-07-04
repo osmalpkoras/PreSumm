@@ -1,0 +1,12 @@
+[0, 1, 2, 3]
+gpu_rank 0
+gpu_rank 0
+[0, 1, 2, 3]
+gpu_rank 3
+gpu_rank 3
+[0, 1, 2, 3]
+gpu_rank 2
+gpu_rank 2
+[0, 1, 2, 3]
+gpu_rank 1
+gpu_rank 1

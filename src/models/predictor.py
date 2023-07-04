@@ -20,6 +20,10 @@ def build_predictor(args, tokenizer, symbols, model, logger=None):
     return translator
 
 
+
+from models.generate import Bass
+
+
 class Translator(object):
     """
     Uses a model to translate a batch of sentences.
@@ -212,10 +216,163 @@ class Translator(object):
            Shouldn't need the original dataset.
         """
         with torch.no_grad():
+            return self._generate(batch, self.max_length, min_length=self.min_length)
             return self._fast_translate_batch(
                 batch,
                 self.max_length,
                 min_length=self.min_length)
+    
+    def _generate(self, batch, max_length, min_length=0):
+        return self._generate3(batch, device="cuda:0", max_length=max_length, min_length=min_length)
+    
+    def _generate3_forward(self, decoder_input, src_features, dec_states, step):
+        dec_out, dec_states = self.model.decoder(decoder_input, src_features, dec_states, step=step)
+        output = self.model.generator[0](dec_out)
+        return None, output[:,-1,:], dec_states
+    
+    def _generate3(self, batch_orig, device, max_length, min_length):
+        
+        max_decoding_length = max_length # model.module.options.transformer_options.max_input_length
+        batch = (batch_orig.src, batch_orig.mask_src, batch_orig.segs)
+        encoder_input_ids, encoder_padding, segmentations = (i.to(device) for i in batch)
+        bos_id = torch.as_tensor(self.start_token, device=device)
+        pad_id = torch.as_tensor(self.symbols['PAD'], device=device)
+        eos_id = torch.as_tensor(self.end_token, device=device)
+        beam_width = self.beam_size
+        length_penalty = torch.as_tensor(0.9, device=device)
+        batch_size = encoder_input_ids.size(0)
+        
+        decoder_input_ids = torch.ones(batch_size, 1, device=device, dtype=encoder_input_ids.dtype) * bos_id
+        decoder_padding = torch.ones(decoder_input_ids.size(), dtype=encoder_padding.dtype, device=device)
+            
+        # Make predictions for this batch    
+        
+        src_features = self.model.bert(encoder_input_ids, segmentations, encoder_padding)
+        dec_states = self.model.decoder.init_decoder_state(encoder_input_ids, src_features, with_cache=True)
+        
+        beam_batch_size = batch_size * beam_width
+        new_order = torch.arange(batch_size, device=device).view(-1, 1).repeat(1, beam_width).view(-1)
+        dec_states.map_batch_fn(
+            lambda state, dim: tile(state, beam_width, dim=dim))
+        src_features = src_features[new_order, :]
+        decoder_input_ids = decoder_input_ids[new_order, :]
+        
+        _, output, dec_states = self._generate3_forward(decoder_input_ids, src_features, dec_states, 0)
+        results = torch.topk(torch.nn.functional.log_softmax(output, dim=-1), dim=-1, k=beam_width)
+        probs = results.values[::beam_width,:]
+        tokens = results.indices[::beam_width,:]
+        
+        decoder_input_ids = torch.cat([decoder_input_ids, torch.reshape(tokens, (-1, 1))], dim=1)
+        decoder_padding = torch.ones(decoder_input_ids.size(), dtype=decoder_padding.dtype, device=device)
+        pad = torch.ones(beam_batch_size, 1, dtype=decoder_input_ids.dtype, device=device) * pad_id
+        scores = torch.reshape(probs, (-1, 1))
+        incomplete_sequences = decoder_input_ids[:, -1] != eos_id
+        encoder_input_ids = encoder_input_ids[new_order, :]
+        
+        
+        sequence_ids = torch.arange(0, beam_batch_size, device=device)
+        best_finished_beam_score = [None for _ in range(0, batch_size)]
+        for decoding_length in range(2, max_decoding_length):
+            if not torch.any(incomplete_sequences):
+                break
+            beam_batches = torch.split(incomplete_sequences, beam_width)
+            incomplete_decoder_input_ids = decoder_input_ids[incomplete_sequences,:]
+            _, output, dec_states = self._generate3_forward(decoder_input_ids[:, -1:], src_features, dec_states, decoding_length-1)
+            output = output[incomplete_sequences,:]
+            
+            
+            if decoding_length < min_length:
+                output[:, self.end_token] = -float("inf")
+
+            # block token-trigrams
+            trigram_dictionary = [{} for _ in range(0, beam_batch_size)]
+            if decoding_length > 2:
+                # for k in sequence_ids[incomplete_sequences]:
+                #     blocked_tokens = trigram_dictionary[k].setdefault(tuple(decoder_input_ids[k, -3:-1].tolist()), [])
+                #     blocked_tokens.append(decoder_input_ids[k, -1])
+                    
+                #     blocked_tokens = trigram_dictionary[k].get(tuple(decoder_input_ids[k, -2:].tolist()))
+                #     if blocked_tokens:
+                #         output[torch.sum(incomplete_sequences[:k+1]) - 1, blocked_tokens] = -float("inf")
+                
+                for i in range(decoder_input_ids.size(0)):
+                    fail = False
+                    words = [int(w) for w in decoder_input_ids[i]]
+                    words = [self.vocab.ids_to_tokens[w] for w in words]
+                    words = ' '.join(words).replace(' ##','').split()
+                    if(len(words)<=3):
+                        continue
+                    trigrams = [(words[i-1],words[i],words[i+1]) for i in range(1,len(words)-1)]
+                    trigram = tuple(trigrams[-1])
+                    if trigram in trigrams[:-1]:
+                        fail = True
+                    if fail:
+                        scores[i] = -float("inf")
+            
+            # get results
+            lengths = torch.ones(scores.size(), dtype=decoder_input_ids.dtype, device=device)
+            results = torch.topk(torch.nn.functional.log_softmax(output, dim=-1), dim=-1, k=beam_width)
+            probs = results.values
+            tokens = results.indices
+            
+            # think of how to vectorize this! this might be possible if you reshape incomplete_sequences or so
+            splits = [torch.sum(c) for c in beam_batches]
+            probs_split = torch.split(probs[:, :], splits, dim=0)
+            tokens_split = torch.split(tokens[:, :], splits, dim=0)
+            scores_split = torch.split(scores[incomplete_sequences, :], splits, dim=0)
+            new_tokens = []
+            new_scores = []
+            for j in range(0, batch_size):
+                remaining_beam_size = int(torch.sum(beam_batches[j]))
+                if remaining_beam_size == 0:
+                    continue
+                p = torch.reshape(probs_split[j], (-1, 1))
+                t = torch.reshape(tokens_split[j], (-1, 1))
+                s = scores_split[j].repeat(1, beam_width).view(-1, 1)
+                
+                results = torch.topk(s + p, dim=0, k=remaining_beam_size)
+                new_scores.append(results.values)
+                new_tokens.append(t[results.indices].reshape(-1, 1))
+                
+                newly_finished_beam_indices = new_tokens[-1] == eos_id
+                penalized_new_scores = new_scores[-1] / torch.pow((5 + decoding_length) / 6, length_penalty)
+                if torch.any(newly_finished_beam_indices):
+                    penalized_new_finished_scores = penalized_new_scores[newly_finished_beam_indices]
+                    if best_finished_beam_score[j] is None or torch.any(penalized_new_finished_scores > best_finished_beam_score[j]):
+                        best_finished_beam_score[j] = torch.max(penalized_new_finished_scores)
+                            
+                if best_finished_beam_score[j]:
+                    new_tokens[-1][penalized_new_scores < best_finished_beam_score[j]] = eos_id
+            
+            scores[incomplete_sequences] = torch.cat(new_scores, dim=0)
+            decoder_input_ids = torch.cat([decoder_input_ids, pad], dim=1)
+            decoder_input_ids[incomplete_sequences, -1:] =  torch.cat(new_tokens, dim=0)
+            decoder_padding = (decoder_input_ids != pad_id).to(decoder_padding.dtype)        
+            incomplete_sequences = torch.logical_and(incomplete_sequences, decoder_input_ids[:, -1] != eos_id)
+        
+        # apply length penalty to scores
+        lengths[:] = max_decoding_length
+        l = (decoder_input_ids == eos_id).nonzero(as_tuple=True)
+        lengths[l[0], 0] = l[1]
+        penalized_scores = scores / torch.pow((5 + lengths) / 6, length_penalty)
+        indices = torch.max(penalized_scores.reshape((batch_size, beam_width)), dim=-1).indices
+        # select best summary
+        generated_summaries = decoder_input_ids.reshape((batch_size, beam_width, -1))[torch.arange(0, batch_size), indices, :]
+        
+        
+        results = {}
+        results["predictions"] = [[] for _ in range(batch_size)]  # noqa: F812
+        results["scores"] = [[] for _ in range(batch_size)]  # noqa: F812
+        results["gold_score"] = [0] * batch_size
+        results["batch"] = batch_orig
+        
+        for i in range(generated_summaries.size(0)):
+            pad_indices = generated_summaries[i,:] != pad_id
+            results["predictions"][i].append(generated_summaries[i,pad_indices])
+            results["scores"][i].append(penalized_scores[i,:])
+        
+        return results
+
 
     def _fast_translate_batch(self,
                               batch,
@@ -328,7 +485,7 @@ class Translator(object):
 
             # Append last prediction.
             alive_seq = torch.cat(
-                [alive_seq.index_select(0, select_indices),
+                [alive_seq.index_select(0, select_indices.to(torch.long)),
                  topk_ids.view(-1, 1)], -1)
 
             is_finished = topk_ids.eq(self.end_token)
@@ -343,7 +500,7 @@ class Translator(object):
                     b = batch_offset[i]
                     if end_condition[i]:
                         is_finished[i].fill_(1)
-                    finished_hyp = is_finished[i].nonzero().view(-1)
+                    finished_hyp = torch.nonzero(is_finished[i]).view(-1)
                     # Store finished hypotheses for this batch.
                     for j in finished_hyp:
                         hypotheses[b].append((
@@ -368,7 +525,7 @@ class Translator(object):
                 alive_seq = predictions.index_select(0, non_finished) \
                     .view(-1, alive_seq.size(-1))
             # Reorder states.
-            select_indices = batch_index.view(-1)
+            select_indices = batch_index.view(-1).to(torch.long)
             src_features = src_features.index_select(0, select_indices)
             dec_states.map_batch_fn(
                 lambda state, dim: state.index_select(dim, select_indices))

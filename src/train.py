@@ -4,12 +4,6 @@
 """
 from __future__ import division
 
-import argparse
-import os
-from others.logging import init_logger
-from train_abstractive import validate_abs, train_abs, baseline, test_abs, test_text_abs
-from train_extractive import train_ext, validate_ext, test_ext
-
 model_flags = ['hidden_size', 'ff_size', 'heads', 'emb_size', 'enc_layers', 'enc_hidden_size', 'enc_ff_size',
                'dec_layers', 'dec_hidden_size', 'dec_ff_size', 'encoder', 'ff_actv', 'use_interval']
 
@@ -26,6 +20,9 @@ def str2bool(v):
 
 
 if __name__ == '__main__':
+    import argparse
+    import os
+
     parser = argparse.ArgumentParser()
     parser.add_argument("-task", default='ext', type=str, choices=['ext', 'abs'])
     parser.add_argument("-encoder", default='bert', type=str, choices=['bert', 'baseline'])
@@ -112,6 +109,11 @@ if __name__ == '__main__':
     args.gpu_ranks = [int(i) for i in range(len(args.visible_gpus.split(',')))]
     args.world_size = len(args.gpu_ranks)
     os.environ["CUDA_VISIBLE_DEVICES"] = args.visible_gpus
+    
+    
+    from others.logging import init_logger
+    from train_abstractive import validate_abs, train_abs, baseline, test_abs, test_text_abs
+    from train_extractive import train_ext, validate_ext, test_ext
 
     init_logger(args.log_file)
     device = "cpu" if args.visible_gpus == '-1' else "cuda"
